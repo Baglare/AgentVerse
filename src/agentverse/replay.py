@@ -1,20 +1,21 @@
-"""Read-only policy playback through the existing NavigationWorld."""
+"""Read-only policy playback through each skill's environment."""
 
 import numpy as np
 
 from .storage import AgentStore
-from .world import MAP, NavigationWorld
+from .skills import skill_spec
 
 
 class ReplaySession:
-    def __init__(self, seed, q=None):
+    def __init__(self, seed, q=None, skill="navigation"):
         if seed < 0:
             raise ValueError("Seed must be nonnegative")
         if q is not None:
-            AgentStore.validate_q(q)
+            AgentStore.validate_q(q, skill)
         self.seed = seed
         self.q = None if q is None else q.copy()
-        self.env = NavigationWorld()
+        self.skill = skill
+        self.env = skill_spec(skill)[0]()
         self.reset()
 
     def reset(self):
@@ -53,15 +54,22 @@ class ReplayViewer:
         self.playing = False
         self.figure, self.axes = plt.subplots(figsize=(7, 7))
         self.figure.subplots_adjust(bottom=0.22, top=0.82)
-        floor = np.array([[cell != "#" for cell in row] for row in MAP], dtype=int)
+        world_map = skill_spec(session.skill)[1]["map"]
+        floor = np.array([[cell != "#" for cell in row] for row in world_map], dtype=int)
         self.axes.imshow(floor, cmap=ListedColormap(["#343a40", "#f1f3f5"]), vmin=0, vmax=1)
-        self.axes.set_xticks(np.arange(-0.5, len(MAP[0]), 1), minor=True)
-        self.axes.set_yticks(np.arange(-0.5, len(MAP), 1), minor=True)
+        self.axes.set_xticks(np.arange(-0.5, len(world_map[0]), 1), minor=True)
+        self.axes.set_yticks(np.arange(-0.5, len(world_map), 1), minor=True)
         self.axes.grid(which="minor", color="white", linewidth=2)
         self.axes.tick_params(which="both", bottom=False, left=False,
                               labelbottom=False, labelleft=False)
-        r, c = session.env.cells[session.env.goal]
-        self.axes.scatter([c], [r], marker="*", s=650, color="#2f9e44", label="Hedef", zorder=3)
+        r, c = session.env.cells[session.env.goal if session.skill == "navigation" else session.env.base]
+        self.axes.scatter([c], [r], marker="*", s=650, color="#2f9e44", label="Hedef" if session.skill == "navigation" else "Us", zorder=3)
+        self.resource_markers = []
+        if session.skill == "resource_collection":
+            for i, position in enumerate(session.env.resources):
+                r, c = session.env.cells[position]
+                self.resource_markers.append(self.axes.scatter(
+                    [c], [r], marker="D", s=180, color="#f08c00", label=f"Kaynak {i + 1}", zorder=3))
         self.marker = self.axes.scatter([], [], s=230, color="#1971c2", label=label, zorder=4)
         self.axes.legend(loc="upper center", bbox_to_anchor=(0.5, -0.02), ncol=2)
         self.next_button = Button(self.figure.add_axes((0.10, 0.05, 0.23, 0.06)), "Adim")
@@ -77,14 +85,20 @@ class ReplayViewer:
 
     def draw(self):
         session = self.session
-        r, c = session.env.cells[session.state]
+        position = session.state if session.skill == "navigation" else session.env.position
+        r, c = session.env.cells[position]
+        inventory = ""
+        if session.skill == "resource_collection":
+            inventory = f" | Kaynaklar: {session.env.collected.bit_count()}/2"
+            for i, marker in enumerate(self.resource_markers):
+                marker.set_visible(not bool(session.env.collected & (1 << i)))
         self.marker.set_offsets([[c, r]])
-        status = ("Hedefe ulasildi" if session.terminated else "Adim siniri" if session.truncated
+        status = ("Basarili" if session.terminated else "Adim siniri" if session.truncated
                   else "Calisiyor" if self.playing else "Duraklatildi")
         action = "-" if session.last_action is None else ("Yukari", "Sag", "Asagi", "Sol")[session.last_action]
         self.axes.set_title(f"{self.label} | seed={session.seed}\n"
                             f"Adim: {session.env.steps}/100 | Odul: {session.total_reward:.2f}\n"
-                            f"{status} | Hareket: {action} | Duvar: {session.collision}")
+                            f"{status}{inventory} | Hareket: {action} | Duvar: {session.collision}")
         self.figure.canvas.draw_idle()
 
     def pause(self):
@@ -131,23 +145,24 @@ class ReplayViewer:
             plt.close(self.figure)
 
 
-def replay(root, name, mode, seed, interval_ms):
+def replay(root, name, mode, seed, interval_ms, skill="navigation", version=None):
     import matplotlib
     from matplotlib.backends.registry import backend_registry
 
     _, framework = backend_registry.resolve_backend(matplotlib.get_backend())
     if framework is None:
         raise ValueError("Replay requires an interactive Matplotlib backend (e.g. MPLBACKEND=TkAgg)")
+    if mode == "random" and version is not None:
+        raise ValueError("Random replay does not use a saved version")
     q = None
-    version = None
     label = "Rastgele ajan"
     if mode == "trained":
         store = AgentStore(root, name)
-        q, metadata, _ = store.load()
+        q, metadata, _ = store.load(skill, version)
         version = metadata["version"]
         label = f"{store.identity['name']} ({version[:8]})"
-    session = ReplaySession(seed, q)
+    session = ReplaySession(seed, q, skill)
     viewer = ReplayViewer(session, label, interval_ms)
     viewer.show()
-    return {"mode": mode, "seed": seed, "version": version,
+    return {"skill_id": skill, "success": session.terminated, "mode": mode, "seed": seed, "version": version,
             "steps": session.env.steps, "reward": session.total_reward}

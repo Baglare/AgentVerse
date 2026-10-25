@@ -9,10 +9,11 @@ import shutil
 import tempfile
 import time
 from uuid import UUID, uuid4
+from zipfile import BadZipFile
 
 import numpy as np
 
-from .world import CONTRACT, NavigationWorld
+from .skills import skill_spec
 
 
 def write_json(path, value):
@@ -68,13 +69,17 @@ class AgentStore:
             raise ValueError("Agent identity mismatch")
         UUID(self.identity["agent_id"])
 
-    def save(self, q, history, seed):
-        self.validate_q(q)
+    def save(self, q, history, seed, skill="navigation"):
+        _, contract = skill_spec(skill)
+        if type(seed) is not int or seed < 0:
+            raise ValueError("Seed must be a nonnegative integer")
+        self.validate_q(q, skill)
+        self.validate_history(history)
         version = str(uuid4())
         metadata = {"schema": 1, "agent_id": self.identity["agent_id"],
-                    "skill_id": "navigation", "version": version,
+                    "skill_id": skill, "version": version,
                     "created_ns": time.time_ns(), "training_seed": seed,
-                    "episodes": len(history), "contract": CONTRACT,
+                    "episodes": len(history), "contract": contract,
                     "algorithm": {"name": "tabular-q-learning", "alpha": 0.1,
                                   "gamma": 0.95, "epsilon_start": 1.0,
                                   "epsilon_end": 0.05, "decay_fraction": 0.8}}
@@ -85,51 +90,90 @@ class AgentStore:
                 stream.flush()
                 os.fsync(stream.fileno())
             metadata["q_sha256"] = hashlib.sha256((path / "q.npz").read_bytes()).hexdigest()
-            write_json(path / "metadata.json", metadata)
             write_json(path / "training.json", history)
+            metadata["training_sha256"] = hashlib.sha256((path / "training.json").read_bytes()).hexdigest()
+            write_json(path / "metadata.json", metadata)
 
-        publish(self.path / "navigation", version, writer)
+        publish(self.path / skill, version, writer)
         return metadata
 
     @staticmethod
-    def validate_q(q):
-        env = NavigationWorld()
-        if (q.shape != (env.observation_space.n, 4) or q.dtype != np.dtype("float64")
+    def validate_q(q, skill="navigation"):
+        env = skill_spec(skill)[0]()
+        if (not isinstance(q, np.ndarray)
+                or q.shape != (env.observation_space.n, env.action_space.n) or q.dtype != np.dtype("float64")
                 or not np.isfinite(q).all()):
             raise ValueError("Invalid Q-table shape, dtype or values")
 
-    def versions(self):
-        parent = self.path / "navigation"
+    @staticmethod
+    def validate_history(history):
+        if not isinstance(history, list) or not history:
+            raise ValueError("Training history must contain episodes")
+        for record in history:
+            if (not isinstance(record, dict)
+                    or type(record.get("steps")) is not int or not 1 <= record["steps"] <= 100
+                    or type(record.get("success")) is not bool
+                    or type(record.get("reward")) not in (int, float)
+                    or not np.isfinite(record["reward"])):
+                raise ValueError("Invalid training history")
+
+    def versions(self, skill="navigation"):
+        _, contract = skill_spec(skill)
+        parent = self.path / skill
         versions = []
         if parent.exists():
             for path in parent.iterdir():
-                if path.name.startswith(".pending-"):
+                if path.name.startswith(".pending-") or path.name in ("evaluations", "reports"):
                     continue
                 UUID(path.name)
                 metadata = read_json(path / "metadata.json")
-                if (metadata["version"] != path.name or metadata["schema"] != 1
-                        or metadata["agent_id"] != self.identity["agent_id"]
-                        or metadata["skill_id"] != "navigation" or metadata["contract"] != CONTRACT):
+                if (not isinstance(metadata, dict)
+                        or metadata.get("version") != path.name or metadata.get("schema") != 1
+                        or metadata.get("agent_id") != self.identity["agent_id"]
+                        or metadata.get("skill_id") != skill or metadata.get("contract") != contract
+                        or type(metadata.get("created_ns")) is not int
+                        or type(metadata.get("episodes")) is not int or metadata["episodes"] <= 0
+                        or type(metadata.get("training_seed")) is not int or metadata["training_seed"] < 0
+                        or not isinstance(metadata.get("q_sha256"), str)):
                     raise ValueError("Skill metadata is incompatible")
                 versions.append(metadata)
         return sorted(versions, key=lambda m: (m["created_ns"], m["version"]))
 
-    def load(self):
-        versions = self.versions()
+    def load(self, skill="navigation", version=None):
+        versions = self.versions(skill)
         if not versions:
-            raise ValueError("No navigation skill saved; train this agent first")
-        metadata = versions[-1]
-        path = self.path / "navigation" / metadata["version"]
+            raise ValueError(f"No {skill} skill saved; train this agent first")
+        metadata = versions[-1] if version is None else next(
+            (m for m in versions if m["version"] == version), None)
+        if metadata is None:
+            raise ValueError("Unknown skill version")
+        path = self.path / skill / metadata["version"]
         payload = (path / "q.npz").read_bytes()
         if hashlib.sha256(payload).hexdigest() != metadata["q_sha256"]:
             raise ValueError("Q-table checksum mismatch")
-        with np.load(BytesIO(payload), allow_pickle=False) as data:
-            if data.files != ["q"]:
-                raise ValueError("Unexpected NPZ contents")
-            q = data["q"]
-        self.validate_q(q)
-        return q, metadata, read_json(path / "training.json")
+        try:
+            with np.load(BytesIO(payload), allow_pickle=False) as data:
+                if data.files != ["q"]:
+                    raise ValueError("Unexpected NPZ contents")
+                q = data["q"]
+        except (BadZipFile, EOFError, TypeError) as error:
+            raise ValueError("Invalid Q-table archive") from error
+        self.validate_q(q, skill)
+        payload = (path / "training.json").read_bytes()
+        # M1 versions predate history checksums; keep them readable without migration.
+        if "training_sha256" in metadata:
+            if hashlib.sha256(payload).hexdigest() != metadata["training_sha256"]:
+                raise ValueError("Training history checksum mismatch")
+        elif skill != "navigation":
+            raise ValueError("Missing training history checksum")
+        history = json.loads(payload)
+        self.validate_history(history)
+        if len(history) != metadata["episodes"]:
+            raise ValueError("Training history length mismatch")
+        return q, metadata, history
 
-    def save_evaluation(self, result):
-        return publish(self.path / "evaluations", str(uuid4()),
+    def save_evaluation(self, result, skill="navigation"):
+        skill_spec(skill)
+        parent = self.path if skill == "navigation" else self.path / skill
+        return publish(parent / "evaluations", str(uuid4()),
                        lambda p: write_json(p / "result.json", result))

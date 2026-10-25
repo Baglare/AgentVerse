@@ -2,13 +2,13 @@
 
 import numpy as np
 
-from .world import NavigationWorld
+from .skills import skill_spec
 
 
-def train(episodes, seed):
+def train(episodes, seed, skill="navigation"):
     if episodes <= 0 or seed < 0:
         raise ValueError("Episodes must be positive and seed nonnegative")
-    env = NavigationWorld()
+    env = skill_spec(skill)[0]()
     rng = np.random.default_rng(np.random.SeedSequence([seed, 0]))
     q = np.zeros((env.observation_space.n, env.action_space.n), dtype=np.float64)
     history = []
@@ -31,10 +31,10 @@ def train(episodes, seed):
     return q, history
 
 
-def evaluate(episodes, seed, q=None):
+def evaluate(episodes, seed, q=None, skill="navigation"):
     if episodes <= 0 or seed < 0:
         raise ValueError("Episodes must be positive and seed nonnegative")
-    env = NavigationWorld()
+    env = skill_spec(skill)[0]()
     # Domain separation from training, even when a caller reuses its seed.
     starts_rng = np.random.default_rng(np.random.SeedSequence([seed, 1]))
     actions_rng = np.random.default_rng(np.random.SeedSequence([seed, 2]))
